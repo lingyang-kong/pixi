@@ -34,7 +34,9 @@ jobs:
 
             - name: Install repository tools
               if: steps.poll.outputs.changed == 'true'
-              run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg jq
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --assume-yes --no-install-recommends apt-utils dpkg-dev gnupg jq
 
             - name: Build APT repository
               if: steps.poll.outputs.changed == 'true'

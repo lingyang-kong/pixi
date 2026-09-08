@@ -10,8 +10,10 @@ locate_pixi_binary() {
 	fi
 
 	local binary_path
-	binary_path="$(find "$extract_dir" -type f -name 'pixi' | head -n 1)"
-	[[ -n $binary_path ]] || fail "unable to locate pixi binary in extracted asset"
+	binary_path="$(find "$extract_dir" -type f -name 'pixi' | head --lines=1)"
+	if [[ -z $binary_path ]]; then
+		fail 'unable to locate pixi binary in extracted asset'
+	fi
 	printf '%s\n' "$binary_path"
 }
 
@@ -44,14 +46,14 @@ build_deb_from_asset() {
 	local staging_dir="$WORK_DIR/package-build/$release_id/$arch"
 	local extract_dir="$staging_dir/extract"
 	local package_root="$staging_dir/root"
-	rm -rf "$staging_dir"
-	mkdir -p "$extract_dir" "$package_root/DEBIAN" "$package_root/usr/bin"
+	rm --recursive --force "$staging_dir"
+	mkdir --parents "$extract_dir" "$package_root/DEBIAN" "$package_root/usr/bin"
 	chmod 0755 "$package_root" "$package_root/DEBIAN" "$package_root/usr" "$package_root/usr/bin"
 
-	tar -xzf "$asset_path" -C "$extract_dir"
+	tar --extract --gzip --file="$asset_path" --directory "$extract_dir"
 	local pixi_binary
 	pixi_binary="$(locate_pixi_binary "$extract_dir")"
-	install -m 0755 "$pixi_binary" "$package_root/usr/bin/pixi"
+	install --mode=0755 "$pixi_binary" "$package_root/usr/bin/pixi"
 	write_control_file "$package_root/DEBIAN/control" "$version" "$arch"
 
 	dpkg-deb --build --root-owner-group "$package_root" "$out_deb" >/dev/null
