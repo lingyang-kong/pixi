@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -o errexit -o nounset -o pipefail
 
-REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$(
+	if ! cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."; then
+		exit 1
+	fi
+	pwd
+)"
 TEST_ROOT="$(mktemp --directory)"
 trap 'rm --recursive --force -- "$TEST_ROOT"' EXIT
 export WORK_DIR="$TEST_ROOT/work"
@@ -10,7 +15,10 @@ export OUT_DIR="$TEST_ROOT/out"
 source "$REPO_DIR/scripts/sync-apt-repo.sh"
 
 mkdir --parents "$TEST_ROOT/asset"
-printf '#!/bin/sh\nprintf "fixture pixi\\n"\n' >"$TEST_ROOT/asset/pixi"
+cat >"$TEST_ROOT/asset/pixi" <<'EOF'
+#!/bin/sh
+printf 'fixture pixi\n'
+EOF
 tar --create --gzip --file="$TEST_ROOT/pixi.tar.gz" --directory="$TEST_ROOT/asset" pixi
 release="$(jq --null-input --compact-output \
 	--arg url "file://$TEST_ROOT/pixi.tar.gz" \

@@ -4,6 +4,12 @@ on:
     schedule:
         - cron: '17 6 * * *'
     workflow_dispatch:
+        inputs:
+            force_build:
+                description: 'Build and publish even when the newest upstream release is unchanged'
+                required: false
+                default: false
+                type: boolean
 
 permissions:
     contents: read
@@ -30,11 +36,13 @@ jobs:
 
             - name: Poll newest release metadata
               id: poll
-              run: echo "changed=$(scripts/sync-apt-repo.sh --check-newest-release "$PUBLISHED_MANIFEST_URL")" >>"$GITHUB_OUTPUT"
+              run: scripts/poll-release.sh "$PUBLISHED_MANIFEST_URL" '${{ inputs.force_build || false }}'
 
             - name: Install repository tools
               if: steps.poll.outputs.changed == 'true'
-              run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg jq
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --assume-yes --no-install-recommends apt-utils dpkg-dev gnupg jq
 
             - name: Build APT repository
               if: steps.poll.outputs.changed == 'true'

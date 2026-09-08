@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -o errexit -o nounset -o pipefail
 
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(
+	if ! cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."; then
+		exit 1
+	fi
+	pwd
+)"
 
 readonly SCRIPT_NAME
 readonly ROOT_DIR
@@ -44,18 +49,22 @@ fail() {
 }
 
 require_command() {
-	command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+	if ! command -v "$1" >/dev/null 2>&1; then
+		fail "missing required command: $1"
+	fi
 }
 
 github_api_get() {
 	local url=$1
 	local args=(
-		-fsSL
-		-H 'Accept: application/vnd.github+json'
-		-H "User-Agent: $USER_AGENT"
+		--fail --silent --show-error --location
+		--header 'Accept: application/vnd.github+json'
+		--header "User-Agent: $USER_AGENT"
 	)
 
-	[[ -n ${GITHUB_TOKEN:-} ]] && args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+	if [[ -n ${GITHUB_TOKEN:-} ]]; then
+		args+=(--header "Authorization: Bearer $GITHUB_TOKEN")
+	fi
 
 	curl "${args[@]}" "$url"
 }
@@ -71,20 +80,6 @@ normalize_release_file() {
 		s/^Label: .*/Label: $ENV{LABEL}/m;
 		s/^Description: .*/Description: $ENV{DESCRIPTION}/m;
 	' "$source" >"$target"
-}
-
-supported_asset_name() {
-	local filename=$1
-
-	case $filename in
-	pixi-x86_64-unknown-linux-musl.tar.gz | \
-		pixi-aarch64-unknown-linux-musl.tar.gz | \
-		pixi-riscv64gc-unknown-linux-gnu.tar.gz)
-		return 0
-		;;
-	esac
-
-	return 1
 }
 
 deb_arch_from_asset_name() {
@@ -107,46 +102,51 @@ deb_arch_from_asset_name() {
 }
 
 supported_asset_stream() {
-	jq -c '.assets[] | select(.name | test("^pixi-(x86_64|aarch64)-unknown-linux-musl\\.tar\\.gz$|^pixi-riscv64gc-unknown-linux-gnu\\.tar\\.gz$"))'
+	jq --compact-output '.assets[] | select(.name | test("^pixi-(x86_64|aarch64)-unknown-linux-musl\\.tar\\.gz$|^pixi-riscv64gc-unknown-linux-gnu\\.tar\\.gz$"))'
 }
 
 release_supported_asset_count() {
-	supported_asset_stream | jq -s 'length'
-}
-
-validate_release_assets() {
-	local release_json=$1
-
-	while IFS= read -r name; do
-		[[ -n $name ]] || continue
-		supported_asset_name "$name" || fail "unrecognized supported asset naming scheme: $name"
-	done < <(supported_asset_stream <<<"$release_json" | jq -r '.name')
+	supported_asset_stream | jq --slurp 'length'
 }
 
 release_supported_asset_bytes() {
-	supported_asset_stream | jq -s '[.[].size] | add // 0'
+	supported_asset_stream | jq --slurp '[.[].size] | add // 0'
 }
 
 collect_stable_releases() {
+	local first_stable=${1:-false}
 	local page=1
 	local page_size=100
+	local payload count stable
 	while :; do
-		local payload
-		payload="$(github_api_get "$API_URL?per_page=$page_size&page=$page")"
-
-		local count
-		count="$(jq 'length' <<<"$payload")"
-		[[ $count -eq 0 ]] && break
-
-		jq -c '.[] | select(.draft | not) | select(.prerelease | not)' <<<"$payload"
-		((page += 1))
-
-		[[ $count -lt $page_size ]] && break
+		if ! payload="$(github_api_get "$API_URL?per_page=$page_size&page=$page")"; then
+			printf 'GitHub releases API request failed on page %s\n' "$page" >&2
+			return 1
+		fi
+		if ! count="$(jq --exit-status 'if type == "array" then length else error("expected a releases array") end' <<<"$payload")"; then
+			printf 'GitHub releases API returned invalid JSON on page %s\n' "$page" >&2
+			return 1
+		fi
+		if ! stable="$(jq --compact-output --argjson first "$first_stable" '
+			def stable: .[] | select(.draft | not) | select(.prerelease | not);
+			if $first then first(stable) else stable end
+		' <<<"$payload")"; then
+			return 1
+		fi
+		if [[ -n $stable ]]; then
+			if ! printf '%s\n' "$stable"; then
+				return 1
+			fi
+		fi
+		if [[ (-n $stable && $first_stable == true) || $count -lt $page_size ]]; then
+			return 0
+		fi
+		page=$((page + 1))
 	done
 }
 
 newest_release_snapshot() {
-	jq -S -c '{
+	jq --sort-keys --compact-output '{
 		release_id: (.id | tostring),
 		tag_name,
 		assets: [
@@ -167,31 +167,36 @@ newest_release_snapshot() {
 
 check_newest_release_changed() {
 	local previous_manifest_url=$1
-	local releases
-	if ! releases="$(collect_stable_releases)"; then
-		fail 'unable to collect stable releases'
+	local release_json
+	if ! release_json="$(collect_stable_releases true)"; then
+		printf '%s\n' 'unable to collect stable releases' >&2
+		return 1
 	fi
-	if [[ -z $releases ]]; then
-		fail 'no stable releases found'
+	if [[ -z $release_json ]]; then
+		printf '%s\n' 'no stable releases found' >&2
+		return 1
 	fi
 
 	local current_snapshot
-	current_snapshot="$(newest_release_snapshot <<<"${releases%%$'\n'*}")"
+	if ! current_snapshot="$(newest_release_snapshot <<<"$release_json")"; then
+		printf '%s\n' 'unable to build newest stable release snapshot' >&2
+		return 1
+	fi
 
 	local previous_manifest
-	if ! previous_manifest="$(curl -fsSL -H "User-Agent: $USER_AGENT" "$previous_manifest_url")"; then
+	if ! previous_manifest="$(curl --fail --silent --show-error --location --header "User-Agent: $USER_AGENT" "$previous_manifest_url")"; then
 		printf '%s\n' 'true'
-		return
+		return 0
 	fi
 
 	local previous_snapshot
-	if ! previous_snapshot="$(jq -e -S -c '.newest_release' <<<"$previous_manifest" 2>/dev/null)"; then
+	if ! previous_snapshot="$(jq --exit-status --sort-keys --compact-output '.newest_release' <<<"$previous_manifest" 2>/dev/null)"; then
 		printf '%s\n' 'true'
-		return
+		return 0
 	fi
-	if [[ -z $previous_snapshot || $previous_snapshot != "$current_snapshot" ]]; then
+	if [[ $previous_snapshot != "$current_snapshot" ]]; then
 		printf '%s\n' 'true'
-		return
+		return 0
 	fi
 
 	printf '%s\n' 'false'
@@ -213,8 +218,12 @@ select_retained_releases() {
 	local selected_file=$2
 
 	mapfile -t releases <"$releases_file"
-	[[ ${#releases[@]} -eq 0 ]] && fail 'no stable releases found'
-	[[ "$(release_supported_asset_count <<<"${releases[0]}")" -eq 0 ]] && fail 'latest stable release has no supported Linux assets'
+	if [[ ${#releases[@]} -eq 0 ]]; then
+		fail 'no stable releases found'
+	fi
+	if [[ "$(release_supported_asset_count <<<"${releases[0]}")" -eq 0 ]]; then
+		fail 'latest stable release has no supported Linux assets'
+	fi
 
 	local selected_releases=()
 	local selected_bytes=()
@@ -224,15 +233,17 @@ select_retained_releases() {
 		local release_json=${releases[idx]}
 		local asset_count
 		asset_count="$(release_supported_asset_count <<<"$release_json")"
-		[[ $asset_count -eq 0 ]] && continue
-
-		validate_release_assets "$release_json"
+		if [[ $asset_count -eq 0 ]]; then
+			continue
+		fi
 
 		local asset_bytes
 		asset_bytes="$(release_supported_asset_bytes <<<"$release_json")"
-		((asset_bytes > MAX_BYTES)) && fail "release $(jq -r '.tag_name' <<<"$release_json") exceeds MAX_BYTES=$MAX_BYTES"
+		if ((asset_bytes > MAX_BYTES)); then
+			fail "release $(jq --raw-output '.tag_name' <<<"$release_json") exceeds MAX_BYTES=$MAX_BYTES"
+		fi
 
-		while ((${#selected_releases[@]} > 0)) && ((MAX_BYTES - total_bytes < asset_bytes)); do
+		while ((${#selected_releases[@]} > 0 && MAX_BYTES - total_bytes < asset_bytes)); do
 			total_bytes=$((total_bytes - selected_bytes[0]))
 			selected_releases=("${selected_releases[@]:1}")
 			selected_bytes=("${selected_bytes[@]:1}")
@@ -243,7 +254,9 @@ select_retained_releases() {
 		total_bytes=$((total_bytes + asset_bytes))
 	done
 
-	[[ ${#selected_releases[@]} -eq 0 ]] && fail 'no stable releases selected'
+	if [[ ${#selected_releases[@]} -eq 0 ]]; then
+		fail 'no stable releases selected'
+	fi
 
 	write_release_list "$selected_file" "${selected_releases[@]}"
 }
@@ -253,13 +266,15 @@ evict_oldest_release() {
 	local tmp_file
 	tmp_file="$(mktemp)"
 
-	if ! tail -n +2 "$selected_file" >"$tmp_file"; then
-		rm -f "$tmp_file"
+	if ! tail --lines=+2 "$selected_file" >"$tmp_file"; then
+		rm --force "$tmp_file"
 		return 1
 	fi
 
 	mv "$tmp_file" "$selected_file"
-	[[ ! -s $selected_file ]] && fail 'cannot evict the final retained release'
+	if [[ ! -s $selected_file ]]; then
+		fail 'cannot evict the final retained release'
+	fi
 }
 
 prepare_release_packages() {
@@ -270,54 +285,64 @@ prepare_release_packages() {
 	: >"$manifest_file"
 
 	local release_id
-	release_id="$(jq -r '.id' <<<"$release_json")"
+	release_id="$(jq --raw-output '.id' <<<"$release_json")"
 	local tag_name
-	tag_name="$(jq -r '.tag_name' <<<"$release_json")"
+	tag_name="$(jq --raw-output '.tag_name' <<<"$release_json")"
 	local published_at
-	published_at="$(jq -r '.published_at' <<<"$release_json")"
+	published_at="$(jq --raw-output '.published_at' <<<"$release_json")"
 	local release_page_url
-	release_page_url="$(jq -r '.html_url' <<<"$release_json")"
+	release_page_url="$(jq --raw-output '.html_url' <<<"$release_json")"
 	local source_tarball_url
-	source_tarball_url="$(jq -r '.tarball_url' <<<"$release_json")"
+	source_tarball_url="$(jq --raw-output '.tarball_url' <<<"$release_json")"
 	local source_zipball_url
-	source_zipball_url="$(jq -r '.zipball_url' <<<"$release_json")"
+	source_zipball_url="$(jq --raw-output '.zipball_url' <<<"$release_json")"
 
 	while IFS= read -r asset_json; do
-		[[ -n $asset_json ]] || continue
+		if [[ -z $asset_json ]]; then
+			continue
+		fi
 
 		local name
-		name="$(jq -r '.name' <<<"$asset_json")"
+		name="$(jq --raw-output '.name' <<<"$asset_json")"
 		local arch
 		arch="$(deb_arch_from_asset_name "$name")"
 		local url
 		local size
-		url="$(jq -r '.browser_download_url' <<<"$asset_json")"
-		size="$(jq -r '.size' <<<"$asset_json")"
+		url="$(jq --raw-output '.browser_download_url' <<<"$asset_json")"
+		size="$(jq --raw-output '.size' <<<"$asset_json")"
 		local destination
 		destination="$WORK_DIR/downloads/$release_id/$name"
 
-		mkdir -p "$(dirname -- "$destination")"
-		[[ -f $destination ]] || curl -fsSL -H "User-Agent: $USER_AGENT" -o "$destination" "$url"
+		mkdir --parents "$(dirname -- "$destination")"
+		if [[ ! -f $destination ]]; then
+			curl --fail --silent --show-error --location --header "User-Agent: $USER_AGENT" --output "$destination" "$url"
+		fi
 
 		local version
 		version="${tag_name#v}"
 		local deb_name="${PACKAGE_NAME}_${version}_${arch}.deb"
 		local package_output="$WORK_DIR/generated-debs/$release_id/$deb_name"
-		mkdir -p "$(dirname -- "$package_output")"
+		mkdir --parents "$(dirname -- "$package_output")"
 		build_deb_from_asset "$destination" "$version" "$arch" "$release_id" "$package_output"
 
 		local package_name
-		package_name="$(dpkg-deb -f "$package_output" Package)"
+		package_name="$(dpkg-deb --field "$package_output" Package)"
 		local package_version
-		package_version="$(dpkg-deb -f "$package_output" Version)"
+		package_version="$(dpkg-deb --field "$package_output" Version)"
 		local package_arch
-		package_arch="$(dpkg-deb -f "$package_output" Architecture)"
+		package_arch="$(dpkg-deb --field "$package_output" Architecture)"
 
-		[[ $package_name == "$PACKAGE_NAME" ]] || fail "unexpected package name in $deb_name: $package_name"
-		[[ $package_version == "$version" ]] || fail "unexpected version in $deb_name: $package_version"
-		[[ $package_arch == "$arch" ]] || fail "architecture mismatch for $deb_name: expected $arch got $package_arch"
+		if [[ $package_name != "$PACKAGE_NAME" ]]; then
+			fail "unexpected package name in $deb_name: $package_name"
+		fi
+		if [[ $package_version != "$version" ]]; then
+			fail "unexpected version in $deb_name: $package_version"
+		fi
+		if [[ $package_arch != "$arch" ]]; then
+			fail "architecture mismatch for $deb_name: expected $arch got $package_arch"
+		fi
 
-		jq -nc \
+		jq --null-input --compact-output \
 			--arg release_id "$release_id" \
 			--arg tag_name "$tag_name" \
 			--arg published_at "$published_at" \
@@ -336,7 +361,7 @@ prepare_release_packages() {
 			--arg pool_path "pool/main/p/pixi/$arch/$release_id/$deb_name" \
 			--arg sha256 "$(sha256sum "$package_output" | awk '{print $1}')" \
 			--argjson upstream_size "$size" \
-			--argjson package_size "$(stat -c '%s' "$package_output")" \
+			--argjson package_size "$(stat --format='%s' "$package_output")" \
 			'{
 				release_id: $release_id,
 				tag_name: $tag_name,
@@ -373,57 +398,65 @@ publish_manifest_packages() {
 generate_apt_metadata() {
 	local manifest_file=$1
 
-	mapfile -t arches < <(jq -r '.arch' "$manifest_file" | sort -u)
+	mapfile -t arches < <(jq --raw-output '.arch' "$manifest_file" | sort --unique)
 	local arch
 	for arch in "${arches[@]}"; do
-		[[ -n $arch ]] || continue
+		if [[ -z $arch ]]; then
+			continue
+		fi
 		local binary_dir="$OUT_DIR/dists/$APT_SUITE/$APT_COMPONENT/binary-$arch"
 		local pool_dir="pool/main/p/pixi/$arch"
-		mkdir -p "$binary_dir"
+		mkdir --parents "$binary_dir"
 		(
 			cd "$OUT_DIR"
 			apt-ftparchive packages "$pool_dir" >"$binary_dir/Packages"
 		)
-		gzip -9c "$binary_dir/Packages" >"$binary_dir/Packages.gz"
+		gzip --best --stdout "$binary_dir/Packages" >"$binary_dir/Packages.gz"
 	done
 
 	local suite_dir="$OUT_DIR/dists/$APT_SUITE"
 	local release_raw="$WORK_DIR/${APT_SUITE}.Release.raw"
 	apt-ftparchive \
-		-o "APT::FTPArchive::Release::Origin=$APT_ORIGIN" \
-		-o "APT::FTPArchive::Release::Label=$APT_LABEL" \
-		-o "APT::FTPArchive::Release::Suite=$APT_SUITE" \
-		-o "APT::FTPArchive::Release::Codename=$APT_SUITE" \
-		-o "APT::FTPArchive::Release::Architectures=${arches[*]}" \
-		-o "APT::FTPArchive::Release::Components=$APT_COMPONENT" \
-		-o "APT::FTPArchive::Release::Description=$APT_DESCRIPTION" \
+		--option "APT::FTPArchive::Release::Origin=$APT_ORIGIN" \
+		--option "APT::FTPArchive::Release::Label=$APT_LABEL" \
+		--option "APT::FTPArchive::Release::Suite=$APT_SUITE" \
+		--option "APT::FTPArchive::Release::Codename=$APT_SUITE" \
+		--option "APT::FTPArchive::Release::Architectures=${arches[*]}" \
+		--option "APT::FTPArchive::Release::Components=$APT_COMPONENT" \
+		--option "APT::FTPArchive::Release::Description=$APT_DESCRIPTION" \
 		release "$suite_dir" >"$release_raw"
 	normalize_release_file "$release_raw" "$suite_dir/Release" "$APT_SUITE"
-	rm -f "$release_raw"
+	rm --force "$release_raw"
 }
 
 sign_repository_metadata() {
-	[[ -n ${APT_GPG_PRIVATE_KEY:-} ]] || fail 'APT_GPG_PRIVATE_KEY is required'
+	if [[ -z ${APT_GPG_PRIVATE_KEY:-} ]]; then
+		fail 'APT_GPG_PRIVATE_KEY is required'
+	fi
 
 	export GNUPGHOME="$WORK_DIR/gnupg"
-	rm -rf "$GNUPGHOME"
-	mkdir -p "$GNUPGHOME"
+	rm --recursive --force "$GNUPGHOME"
+	mkdir --parents "$GNUPGHOME"
 	chmod 700 "$GNUPGHOME"
 
 	gpg --batch --import <<<"$APT_GPG_PRIVATE_KEY" >/dev/null 2>&1
 
 	local key_id
 	key_id="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^sec:/ { print $5; exit }')"
-	[[ -n $key_id ]] || fail 'no secret key available after import'
+	if [[ -z $key_id ]]; then
+		fail 'no secret key available after import'
+	fi
 
 	gpg --batch --yes --export "$key_id" >"$OUT_DIR/pixi-archive-keyring.gpg"
 
 	while IFS= read -r release_file; do
-		[[ -n $release_file ]] || continue
+		if [[ -z $release_file ]]; then
+			continue
+		fi
 		local release_dir
 		release_dir="$(dirname -- "$release_file")"
-		gpg --batch --yes --clearsign -u "$key_id" -o "$release_dir/InRelease" "$release_file"
-		gpg --batch --yes --detach-sign -u "$key_id" -o "$release_dir/Release.gpg" "$release_file"
+		gpg --batch --yes --clearsign --local-user "$key_id" --output "$release_dir/InRelease" "$release_file"
+		gpg --batch --yes --detach-sign --local-user "$key_id" --output "$release_dir/Release.gpg" "$release_file"
 	done < <(find "$OUT_DIR/dists" -name 'Release' -type f | sort)
 }
 
@@ -431,11 +464,11 @@ write_release_manifest() {
 	local manifest_file=$1
 	local selected_file=$2
 	local newest_release
-	newest_release="$(tail -n 1 "$selected_file" | newest_release_snapshot)"
+	newest_release="$(tail --lines=1 "$selected_file" | newest_release_snapshot)"
 
-	jq -s \
+	jq --slurp \
 		--arg api_repo "$API_REPO" \
-		--arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		--arg generated_at "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" \
 		--arg package_name "$PACKAGE_NAME" \
 		--arg suite "$APT_SUITE" \
 		--argjson max_bytes "$MAX_BYTES" \
@@ -446,14 +479,14 @@ write_release_manifest() {
 
 measure_pages_artifact_bytes() {
 	local archive="$WORK_DIR/pages-size-check.tar"
-	rm -f "$archive"
+	rm --force "$archive"
 	tar \
 		--dereference --hard-dereference \
 		--directory "$OUT_DIR" \
-		-cf "$archive" \
+		--create --file "$archive" \
 		.
-	stat -c '%s' "$archive"
-	rm -f "$archive"
+	stat --format='%s' "$archive"
+	rm --force "$archive"
 }
 
 copy_site_documents() {
@@ -467,8 +500,8 @@ build_repository() {
 	local selected_file=$1
 	local manifest_file=$2
 
-	rm -rf "$OUT_DIR"
-	mkdir -p "$OUT_DIR"
+	rm --recursive --force "$OUT_DIR"
+	mkdir --parents "$OUT_DIR"
 
 	local release_json
 	local release_manifest="$WORK_DIR/release-packages.ndjson"
@@ -497,13 +530,17 @@ enforce_pages_size_limit() {
 
 main() {
 	if [[ ${1:-} == '--check-newest-release' ]]; then
-		[[ $# -eq 2 ]] || fail "usage: $SCRIPT_NAME --check-newest-release URL"
+		if [[ $# -ne 2 ]]; then
+			fail "usage: $SCRIPT_NAME --check-newest-release URL"
+		fi
 		require_command curl
 		require_command jq
 		check_newest_release_changed "$2"
 		return
 	fi
-	[[ $# -eq 0 ]] || fail "usage: $SCRIPT_NAME [--check-newest-release URL]"
+	if [[ $# -ne 0 ]]; then
+		fail "usage: $SCRIPT_NAME [--check-newest-release URL]"
+	fi
 
 	local required_command_name
 	for required_command_name in \
@@ -522,14 +559,16 @@ main() {
 		require_command "$required_command_name"
 	done
 
-	rm -rf "$WORK_DIR" "$OUT_DIR"
-	mkdir -p "$WORK_DIR" "$OUT_DIR"
+	rm --recursive --force "$WORK_DIR" "$OUT_DIR"
+	mkdir --parents "$WORK_DIR" "$OUT_DIR"
 
 	local releases_file="$WORK_DIR/releases.ndjson"
 	local selected_file="$WORK_DIR/selected.ndjson"
 	local manifest_file="$WORK_DIR/manifest.ndjson"
 
-	collect_stable_releases >"$releases_file"
+	if ! collect_stable_releases >"$releases_file"; then
+		fail 'unable to collect stable releases'
+	fi
 	select_retained_releases "$releases_file" "$selected_file"
 	enforce_pages_size_limit "$selected_file" "$manifest_file"
 }
