@@ -117,24 +117,34 @@ release_supported_asset_bytes() {
 }
 
 collect_stable_releases() {
+	local first_stable=${1:-false}
 	local page=1
 	local page_size=100
+	local payload count stable
 	while :; do
-		local payload
-		payload="$(github_api_get "$API_URL?per_page=$page_size&page=$page")"
-
-		local count
-		count="$(jq 'length' <<<"$payload")"
-		if ((count == 0)); then
-			break
+		if ! payload="$(github_api_get "$API_URL?per_page=$page_size&page=$page")"; then
+			printf 'GitHub releases API request failed on page %s\n' "$page" >&2
+			return 1
 		fi
-
-		jq --compact-output '.[] | select(.draft | not) | select(.prerelease | not)' <<<"$payload"
-		((page += 1))
-
-		if ((count < page_size)); then
-			break
+		if ! count="$(jq --exit-status 'if type == "array" then length else error("expected a releases array") end' <<<"$payload")"; then
+			printf 'GitHub releases API returned invalid JSON on page %s\n' "$page" >&2
+			return 1
 		fi
+		if ! stable="$(jq --compact-output --argjson first "$first_stable" '
+			def stable: .[] | select(.draft | not) | select(.prerelease | not);
+			if $first then first(stable) else stable end
+		' <<<"$payload")"; then
+			return 1
+		fi
+		if [[ -n $stable ]]; then
+			if ! printf '%s\n' "$stable"; then
+				return 1
+			fi
+		fi
+		if [[ (-n $stable && $first_stable == true) || $count -lt $page_size ]]; then
+			return 0
+		fi
+		page=$((page + 1))
 	done
 }
 
@@ -160,31 +170,36 @@ newest_release_snapshot() {
 
 check_newest_release_changed() {
 	local previous_manifest_url=$1
-	local releases
-	if ! releases="$(collect_stable_releases)"; then
-		fail 'unable to collect stable releases'
+	local release_json
+	if ! release_json="$(collect_stable_releases true)"; then
+		printf '%s\n' 'unable to collect stable releases' >&2
+		return 1
 	fi
-	if [[ -z $releases ]]; then
-		fail 'no stable releases found'
+	if [[ -z $release_json ]]; then
+		printf '%s\n' 'no stable releases found' >&2
+		return 1
 	fi
 
 	local current_snapshot
-	current_snapshot="$(newest_release_snapshot <<<"${releases%%$'\n'*}")"
+	if ! current_snapshot="$(newest_release_snapshot <<<"$release_json")"; then
+		printf '%s\n' 'unable to build newest stable release snapshot' >&2
+		return 1
+	fi
 
 	local previous_manifest
 	if ! previous_manifest="$(curl --fail --silent --show-error --location --header "User-Agent: $USER_AGENT" "$previous_manifest_url")"; then
 		printf '%s\n' 'true'
-		return
+		return 0
 	fi
 
 	local previous_snapshot
 	if ! previous_snapshot="$(jq --exit-status --sort-keys --compact-output '.newest_release' <<<"$previous_manifest" 2>/dev/null)"; then
 		printf '%s\n' 'true'
-		return
+		return 0
 	fi
-	if [[ -z $previous_snapshot || $previous_snapshot != "$current_snapshot" ]]; then
+	if [[ $previous_snapshot != "$current_snapshot" ]]; then
 		printf '%s\n' 'true'
-		return
+		return 0
 	fi
 
 	printf '%s\n' 'false'
@@ -893,7 +908,9 @@ main() {
 		fail 'unable to fingerprint package recipe'
 	fi
 
-	collect_stable_releases >"$releases_file"
+	if ! collect_stable_releases >"$releases_file"; then
+		fail 'unable to collect stable releases'
+	fi
 	select_retained_releases "$releases_file" "$selected_file"
 	enforce_pages_size_limit "$selected_file" "$manifest_file" "$recipe_key"
 	prune_package_cache "$manifest_file" "$PACKAGE_CACHE_EXTRA_BYTES"

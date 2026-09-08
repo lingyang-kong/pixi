@@ -18,7 +18,10 @@ source "$REPO_DIR/scripts/sync-apt-repo.sh"
 recipe_key="$(package_recipe_key)"
 
 mkdir --parents "$TEST_ROOT/asset"
-printf '#!/bin/sh\nprintf "fixture pixi\\n"\n' >"$TEST_ROOT/asset/pixi"
+cat >"$TEST_ROOT/asset/pixi" <<'EOF'
+#!/bin/sh
+printf 'fixture pixi\n'
+EOF
 tar --create --gzip --file="$TEST_ROOT/pixi.tar.gz" --directory="$TEST_ROOT/asset" pixi
 release="$(jq --null-input --compact-output \
 	--arg url "file://$TEST_ROOT/pixi.tar.gz" \
