@@ -21,6 +21,7 @@ readonly MAX_BYTES="${MAX_BYTES:-1000000000}"
 readonly PACKAGE_CACHE_EXTRA_BYTES="${PACKAGE_CACHE_EXTRA_BYTES:-$MAX_BYTES}"
 readonly USER_AGENT='pixi-apt-sync'
 readonly INDEX_TEMPLATE="$ROOT_DIR/templates/index.html"
+readonly SUPPORTED_ASSET_REGEX='^pixi-(x86_64|aarch64)-unknown-linux-musl\.tar\.gz$|^pixi-riscv64gc-unknown-linux-gnu\.tar\.gz$'
 readonly APT_SUITE="${APT_SUITE:-stable}"
 readonly APT_COMPONENT="${APT_COMPONENT:-main}"
 readonly APT_ORIGIN='Unofficial Pixi Mirror'
@@ -104,18 +105,6 @@ deb_arch_from_asset_name() {
 	esac
 }
 
-supported_asset_stream() {
-	jq --compact-output '.assets[] | select(.name | test("^pixi-(x86_64|aarch64)-unknown-linux-musl\\.tar\\.gz$|^pixi-riscv64gc-unknown-linux-gnu\\.tar\\.gz$"))'
-}
-
-release_supported_asset_count() {
-	supported_asset_stream | jq --slurp 'length'
-}
-
-release_supported_asset_bytes() {
-	supported_asset_stream | jq --slurp '[.[].size] | add // 0'
-}
-
 collect_stable_releases() {
 	local first_stable=${1:-false}
 	local page=1
@@ -149,12 +138,12 @@ collect_stable_releases() {
 }
 
 newest_release_snapshot() {
-	jq --sort-keys --compact-output '{
+	jq --sort-keys --compact-output --arg supported_asset_regex "$SUPPORTED_ASSET_REGEX" '{
 		release_id: (.id | tostring),
 		tag_name,
 		assets: [
 			.assets[]
-			| select(.name | test("^pixi-(x86_64|aarch64)-unknown-linux-musl\\.tar\\.gz$|^pixi-riscv64gc-unknown-linux-gnu\\.tar\\.gz$"))
+			| select(.name | test($supported_asset_regex))
 			| {
 				asset_id: (.id | tostring),
 				name,
@@ -205,79 +194,90 @@ check_newest_release_changed() {
 	printf '%s\n' 'false'
 }
 
-write_release_list() {
-	local selected_file=$1
-	shift
-	: >"$selected_file"
-
-	local release_json
-	for release_json in "$@"; do
-		printf '%s\n' "$release_json" >>"$selected_file"
-	done
+select_release_candidates() {
+	local releases_file=$1
+	local candidates_file=$2
+	if ! jq --compact-output --slurp --arg supported_asset_regex "$SUPPORTED_ASSET_REGEX" '
+		map(.assets = [(.assets // [])[] | select(.name | test($supported_asset_regex))])
+		| if length == 0 then
+			error("no stable releases found")
+		elif (.[0].assets | length) == 0 then
+				error("latest stable release has no supported Linux assets")
+		else
+			map(select(.assets | length > 0))[]
+		end
+	' "$releases_file" >"$candidates_file"; then
+		fail 'unable to select release candidates'
+	fi
 }
 
-select_retained_releases() {
-	local releases_file=$1
-	local selected_file=$2
-
-	mapfile -t releases <"$releases_file"
-	if ((${#releases[@]} == 0)); then
-		fail 'no stable releases found'
-	fi
-	if [[ "$(release_supported_asset_count <<<"${releases[0]}")" -eq 0 ]]; then
-		fail 'latest stable release has no supported Linux assets'
+remove_manifest_packages() {
+	local manifest_file=$1
+	if [[ ! -s $manifest_file ]]; then
+		return 0
 	fi
 
-	local selected_releases=()
-	local selected_bytes=()
-	local total_bytes=0
-	local idx
-	for ((idx = ${#releases[@]} - 1; idx >= 0; idx--)); do
-		local release_json=${releases[idx]}
-		local asset_count
-		asset_count="$(release_supported_asset_count <<<"$release_json")"
-		if ((asset_count == 0)); then
+	local pool_path
+	while IFS= read -r pool_path; do
+		if [[ -z $pool_path ]]; then
 			continue
 		fi
-
-		local asset_bytes
-		asset_bytes="$(release_supported_asset_bytes <<<"$release_json")"
-		if ((asset_bytes > MAX_BYTES)); then
-			fail "release $(jq --raw-output '.tag_name' <<<"$release_json") exceeds MAX_BYTES=$MAX_BYTES"
+		rm --force -- "$OUT_DIR/$pool_path"
+		local release_dir
+		release_dir="$(dirname -- "$OUT_DIR/$pool_path")"
+		if rmdir --ignore-fail-on-non-empty "$release_dir" 2>/dev/null; then
+			:
 		fi
-
-		while ((${#selected_releases[@]} > 0 && MAX_BYTES - total_bytes < asset_bytes)); do
-			total_bytes=$((total_bytes - selected_bytes[0]))
-			selected_releases=("${selected_releases[@]:1}")
-			selected_bytes=("${selected_bytes[@]:1}")
-		done
-
-		selected_releases+=("$release_json")
-		selected_bytes+=("$asset_bytes")
-		total_bytes=$((total_bytes + asset_bytes))
-	done
-
-	if ((${#selected_releases[@]} == 0)); then
-		fail 'no stable releases selected'
-	fi
-
-	write_release_list "$selected_file" "${selected_releases[@]}"
+	done < <(jq --raw-output '.pool_path // empty' "$manifest_file")
 }
 
 evict_oldest_release() {
 	local selected_file=$1
+	local manifest_file=$2
+
+	if [[ ! -s $selected_file ]]; then
+		fail 'cannot evict the oldest release: no retained releases'
+	fi
+	if [[ ! -s $manifest_file ]]; then
+		fail 'cannot evict the oldest release: no package manifest'
+	fi
+
+	local release_count
+	release_count="$(wc --lines <"$selected_file")"
+	if ((release_count <= 1)); then
+		fail 'cannot evict the final retained release: it exceeds the Pages size limit'
+	fi
+
+	local oldest_release_id
+	oldest_release_id="$(head --lines=1 "$selected_file" | jq --raw-output '.id // empty')"
+	if [[ -z $oldest_release_id ]]; then
+		fail 'cannot evict the oldest release: selected release has no id'
+	fi
+	local evicted_manifest
+	evicted_manifest="$(mktemp)"
+	jq --compact-output --arg release_id "$oldest_release_id" \
+		'select((.release_id | tostring) == $release_id)' \
+		"$manifest_file" >"$evicted_manifest"
+	if [[ ! -s $evicted_manifest ]]; then
+		fail "cannot evict release $oldest_release_id: no package records"
+	fi
+	remove_manifest_packages "$evicted_manifest"
+	rm --force -- "$evicted_manifest"
+
 	local tmp_file
 	tmp_file="$(mktemp)"
-
 	if ! tail --lines=+2 "$selected_file" >"$tmp_file"; then
-		rm --force "$tmp_file"
+		rm --force -- "$tmp_file"
 		return 1
 	fi
-
 	mv "$tmp_file" "$selected_file"
-	if [[ ! -s $selected_file ]]; then
-		fail 'cannot evict the final retained release'
-	fi
+
+	local manifest_tmp
+	manifest_tmp="$(mktemp)"
+	jq --compact-output --arg release_id "$oldest_release_id" \
+		'select((.release_id | tostring) != $release_id)' \
+		"$manifest_file" >"$manifest_tmp"
+	mv "$manifest_tmp" "$manifest_file"
 }
 
 package_recipe_key_for() {
@@ -595,6 +595,7 @@ prune_package_cache() {
 }
 
 prepare_release_packages() {
+	# Candidate selection has already restricted assets to supported builds.
 	local release_json=$1
 	local manifest_file=$2
 	local recipe_key=$3
@@ -710,7 +711,7 @@ prepare_release_packages() {
 				cache_key: $cache_key,
 				sha256: $cache_metadata.deb_sha256
 			}' >>"$manifest_file"
-	done < <(supported_asset_stream <<<"$release_json")
+	done < <(jq --compact-output '.assets[]' <<<"$release_json")
 }
 
 publish_manifest_packages() {
@@ -756,25 +757,39 @@ generate_apt_metadata() {
 	rm --force "$release_raw"
 }
 
-sign_repository_metadata() {
+initialize_repository_signing() {
 	if [[ -z ${APT_GPG_PRIVATE_KEY:-} ]]; then
 		fail 'APT_GPG_PRIVATE_KEY is required'
 	fi
 
-	export GNUPGHOME="$WORK_DIR/gnupg"
-	rm --recursive --force "$GNUPGHOME"
-	mkdir --parents "$GNUPGHOME"
-	chmod 700 "$GNUPGHOME"
+	local gpg_home="$WORK_DIR/gnupg"
+	if ! rm --recursive --force "$gpg_home"; then
+		fail 'unable to clear the repository signing-key directory'
+	fi
+	if ! mkdir --mode=700 "$gpg_home"; then
+		fail 'unable to create the repository signing-key directory'
+	fi
 
-	gpg --batch --import <<<"$APT_GPG_PRIVATE_KEY" >/dev/null 2>&1
+	if ! gpg --homedir "$gpg_home" --batch --import <<<"$APT_GPG_PRIVATE_KEY" >/dev/null 2>&1; then
+		fail 'unable to import the repository signing key'
+	fi
 
 	local key_id
-	key_id="$(gpg --batch --list-secret-keys --with-colons | awk -F ':' '/^sec:/ { print $5; exit }')"
+	if ! key_id="$(gpg --homedir "$gpg_home" --batch --list-secret-keys --with-colons | awk -F: '/^sec:/ { print $5; exit }')"; then
+		fail 'unable to list repository signing keys'
+	fi
 	if [[ -z $key_id ]]; then
 		fail 'no secret key available after import'
 	fi
 
-	gpg --batch --yes --export "$key_id" >"$OUT_DIR/pixi-archive-keyring.gpg"
+	if ! gpg --homedir "$gpg_home" --batch --yes --export "$key_id" >"$OUT_DIR/pixi-archive-keyring.gpg"; then
+		fail 'unable to export the repository signing key'
+	fi
+	printf '%s\n' "$key_id"
+}
+
+sign_repository_metadata() {
+	local key_id=$1
 
 	while IFS= read -r release_file; do
 		if [[ -z $release_file ]]; then
@@ -782,8 +797,8 @@ sign_repository_metadata() {
 		fi
 		local release_dir
 		release_dir="$(dirname -- "$release_file")"
-		gpg --batch --yes --clearsign --local-user "$key_id" --output "$release_dir/InRelease" "$release_file"
-		gpg --batch --yes --detach-sign --local-user "$key_id" --output "$release_dir/Release.gpg" "$release_file"
+		gpg --homedir "$WORK_DIR/gnupg" --batch --yes --clearsign --local-user "$key_id" --output "$release_dir/InRelease" "$release_file"
+		gpg --homedir "$WORK_DIR/gnupg" --batch --yes --detach-sign --local-user "$key_id" --output "$release_dir/Release.gpg" "$release_file"
 	done < <(find "$OUT_DIR/dists" -name 'Release' -type f | sort)
 }
 
@@ -795,7 +810,7 @@ write_release_manifest() {
 
 	jq --slurp \
 		--arg api_repo "$API_REPO" \
-		--arg generated_at "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" \
+		--arg generated_at "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
 		--arg package_name "$PACKAGE_NAME" \
 		--arg suite "$APT_SUITE" \
 		--argjson max_bytes "$MAX_BYTES" \
@@ -805,15 +820,11 @@ write_release_manifest() {
 }
 
 measure_pages_artifact_bytes() {
-	local archive="$WORK_DIR/pages-size-check.tar"
-	rm --force "$archive"
 	tar \
 		--dereference --hard-dereference \
 		--directory "$OUT_DIR" \
-		--create --file="$archive" \
-		.
-	stat --format='%s' "$archive"
-	rm --force "$archive"
+		--create --file=- \
+		. | wc --bytes
 }
 
 copy_site_documents() {
@@ -823,37 +834,93 @@ copy_site_documents() {
 	cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$OUT_DIR/THIRD_PARTY_NOTICES.md"
 }
 
-build_repository() {
+refresh_repository_metadata() {
 	local selected_file=$1
 	local manifest_file=$2
-	local recipe_key=$3
+	local key_id=$3
 
-	rm --recursive --force "$OUT_DIR"
-	mkdir --parents "$OUT_DIR"
-
-	local release_json
-	local release_manifest="$WORK_DIR/release-packages.ndjson"
-	: >"$manifest_file"
-	while IFS= read -r release_json; do
-		prepare_release_packages "$release_json" "$release_manifest" "$recipe_key"
-		cat -- "$release_manifest" >>"$manifest_file"
-	done <"$selected_file"
-	publish_manifest_packages "$manifest_file"
+	# A previous metadata tree can contain package indices and signatures for
+	# releases evicted during this run.  Remove it before apt-ftparchive scans
+	# the pool so that Release only describes the retained repository.
+	rm --recursive --force "$OUT_DIR/dists"
 	generate_apt_metadata "$manifest_file"
-	sign_repository_metadata
+	sign_repository_metadata "$key_id"
 	write_release_manifest "$manifest_file" "$selected_file"
-	copy_site_documents
 }
 
 enforce_pages_size_limit() {
-	local selected_file=$1
-	local manifest_file=$2
-	local recipe_key=$3
+	local candidates_file=$1
+	local selected_file=$2
+	local manifest_file=$3
+	local recipe_key=$4
 
-	build_repository "$selected_file" "$manifest_file" "$recipe_key"
-	while (($(measure_pages_artifact_bytes) >= MAX_BYTES)); do
-		evict_oldest_release "$selected_file"
-		build_repository "$selected_file" "$manifest_file" "$recipe_key"
+	if [[ ! -s $candidates_file ]]; then
+		fail 'no stable release candidates'
+	fi
+	local candidate_manifest_file="$WORK_DIR/retention-candidate-manifest.ndjson"
+	local total_package_bytes=0
+	local retained_release_count=0
+	: >"$selected_file"
+	: >"$manifest_file"
+	rm --recursive --force "$OUT_DIR"
+	mkdir --parents "$OUT_DIR"
+
+	# Candidates are newest-first. Build that prefix once, then publish only the
+	# releases that fit the package budget.
+	local release_json
+	while IFS= read -r release_json; do
+		if [[ -z $release_json ]]; then
+			continue
+		fi
+		if ((total_package_bytes == MAX_BYTES)); then
+			break
+		fi
+
+		prepare_release_packages "$release_json" "$candidate_manifest_file" "$recipe_key"
+		if [[ ! -s $candidate_manifest_file ]]; then
+			fail "release $(jq --raw-output '.tag_name // .id' <<<"$release_json") produced no packages"
+		fi
+
+		local release_package_bytes
+		release_package_bytes="$(jq --slurp 'map(.package_size) | add' "$candidate_manifest_file")"
+		if ((release_package_bytes > MAX_BYTES - total_package_bytes)); then
+			if ((retained_release_count == 0)); then
+				fail "latest stable release $(jq --raw-output '.tag_name // .id' <<<"$release_json") exceeds MAX_BYTES=$MAX_BYTES after package generation"
+			fi
+			break
+		fi
+
+		printf '%s\n' "$release_json" >>"$selected_file"
+		cat "$candidate_manifest_file" >>"$manifest_file"
+		total_package_bytes=$((total_package_bytes + release_package_bytes))
+		retained_release_count=$((retained_release_count + 1))
+	done <"$candidates_file"
+
+	if ((retained_release_count == 0)); then
+		fail 'no stable releases fit within the package size limit'
+	fi
+
+	# Restore oldest-first ordering once, after appending candidates newest-first.
+	local order_tmp
+	order_tmp="$(mktemp)"
+	jq --compact-output --slurp 'reverse[]' "$selected_file" >"$order_tmp"
+	mv -- "$order_tmp" "$selected_file"
+	jq --compact-output --slurp 'reverse[]' "$manifest_file" >"$candidate_manifest_file"
+	mv -- "$candidate_manifest_file" "$manifest_file"
+	publish_manifest_packages "$manifest_file"
+	copy_site_documents
+	local key_id
+	key_id="$(initialize_repository_signing)"
+	refresh_repository_metadata "$selected_file" "$manifest_file" "$key_id"
+	local artifact_bytes
+	while :; do
+		artifact_bytes="$(measure_pages_artifact_bytes)"
+		if ((artifact_bytes < MAX_BYTES)); then
+			break
+		fi
+
+		evict_oldest_release "$selected_file" "$manifest_file"
+		refresh_repository_metadata "$selected_file" "$manifest_file" "$key_id"
 	done
 }
 
@@ -886,11 +953,13 @@ main() {
 		mktemp \
 		mv \
 		perl \
+		rmdir \
 		sed \
 		sha256sum \
 		stat \
 		tar \
-		touch; do
+		touch \
+		wc; do
 		require_command "$required_command_name"
 	done
 	if [[ ! $PACKAGE_CACHE_EXTRA_BYTES =~ ^[0-9]+$ ]]; then
@@ -911,8 +980,9 @@ main() {
 	if ! collect_stable_releases >"$releases_file"; then
 		fail 'unable to collect stable releases'
 	fi
-	select_retained_releases "$releases_file" "$selected_file"
-	enforce_pages_size_limit "$selected_file" "$manifest_file" "$recipe_key"
+	local candidates_file="$WORK_DIR/candidates.ndjson"
+	select_release_candidates "$releases_file" "$candidates_file"
+	enforce_pages_size_limit "$candidates_file" "$selected_file" "$manifest_file" "$recipe_key"
 	prune_package_cache "$manifest_file" "$PACKAGE_CACHE_EXTRA_BYTES"
 }
 
