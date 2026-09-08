@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -o errexit -o nounset -o pipefail
 
-REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$(
+	if ! cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."; then
+		exit 1
+	fi
+	pwd
+)"
 TEST_ROOT="$(mktemp --directory)"
 trap 'rm --recursive --force -- "$TEST_ROOT"' EXIT
 export WORK_DIR="$TEST_ROOT/work"
 export OUT_DIR="$TEST_ROOT/out"
+export CACHE_DIR="$TEST_ROOT/cache"
 # shellcheck source=/dev/null
 source "$REPO_DIR/scripts/sync-apt-repo.sh"
+
+recipe_key="$(package_recipe_key)"
 
 mkdir --parents "$TEST_ROOT/asset"
 printf '#!/bin/sh\nprintf "fixture pixi\\n"\n' >"$TEST_ROOT/asset/pixi"
@@ -20,7 +28,7 @@ release="$(jq --null-input --compact-output \
 	  zipball_url: "https://example.invalid/source.zip",
 	  assets: [{id: 2, name: "pixi-x86_64-unknown-linux-musl.tar.gz", browser_download_url: $url, size: $size}]}')"
 manifest="$TEST_ROOT/packages.ndjson"
-prepare_release_packages "$release" "$manifest"
+prepare_release_packages "$release" "$manifest" "$recipe_key"
 if [[ -e $OUT_DIR ]]; then
 	fail 'package preparation wrote into the publication directory'
 fi

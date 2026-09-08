@@ -20,7 +20,6 @@ jobs:
         outputs:
             changed: ${{ steps.poll.outputs.changed }}
         env:
-            APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
             MAX_BYTES: 1000000000
             PUBLISHED_MANIFEST_URL: https://lingyang-kong.github.io/pixi/releases.json
@@ -32,13 +31,34 @@ jobs:
               id: poll
               run: echo "changed=$(scripts/sync-apt-repo.sh --check-newest-release "$PUBLISHED_MANIFEST_URL")" >>"$GITHUB_OUTPUT"
 
+            - name: Restore package cache
+              if: steps.poll.outputs.changed == 'true'
+              id: package-cache
+              uses: actions/cache/restore@v4
+              with:
+                  path: .build/pixi-cache
+                  key: pixi-deb-cache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+                  restore-keys: |
+                      pixi-deb-cache-${{ runner.os }}-
+
             - name: Install repository tools
               if: steps.poll.outputs.changed == 'true'
-              run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg jq
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --assume-yes --no-install-recommends apt-utils dpkg-dev gnupg jq
 
             - name: Build APT repository
               if: steps.poll.outputs.changed == 'true'
+              env:
+                  APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
               run: scripts/sync-apt-repo.sh
+
+            - name: Save package cache
+              if: steps.poll.outputs.changed == 'true'
+              uses: actions/cache/save@v4
+              with:
+                  path: .build/pixi-cache
+                  key: pixi-deb-cache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
             - name: Configure GitHub Pages
               if: steps.poll.outputs.changed == 'true'

@@ -20,6 +20,8 @@ This repository is unofficial. It is not operated, sponsored, or endorsed by pre
 
 Retained releases coexist under `pool/main/p/pixi/<arch>/` without overwriting each other.
 
+The publisher keeps reproducible package outputs in `.build/pixi-cache` between runs. Published packages are retained, and recently used packages that were rejected by the Pages-size limit may use up to `PACKAGE_CACHE_EXTRA_BYTES` additional bytes; it defaults to the `MAX_BYTES` limit. Set that variable to reduce or disable the extra cache budget.
+
 ## Compliance and Provenance
 
 - Original automation and templates in this repository are licensed under the MIT License in [LICENSE](LICENSE).

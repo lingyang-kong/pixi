@@ -10,9 +10,30 @@ locate_pixi_binary() {
 	fi
 
 	local binary_path
-	binary_path="$(find "$extract_dir" -type f -name 'pixi' | head -n 1)"
-	[[ -n $binary_path ]] || fail "unable to locate pixi binary in extracted asset"
+	if ! binary_path="$(find "$extract_dir" -type f -name 'pixi' -print -quit)"; then
+		return 1
+	fi
+	if [[ -z $binary_path ]]; then
+		return 1
+	fi
 	printf '%s\n' "$binary_path"
+}
+
+source_date_epoch_for_release() {
+	local published_at=$1
+	local epoch=${SOURCE_DATE_EPOCH:-}
+
+	if [[ -z $epoch ]]; then
+		if ! epoch="$(date --utc --date="$published_at" '+%s')"; then
+			return 1
+		fi
+	fi
+	if [[ $epoch =~ ^[0-9]+$ ]]; then
+		printf '%s\n' "$epoch"
+		return 0
+	fi
+
+	return 1
 }
 
 write_control_file() {
@@ -40,19 +61,65 @@ build_deb_from_asset() {
 	local arch=$3
 	local release_id=$4
 	local out_deb=$5
+	local source_date_epoch=$6
 
 	local staging_dir="$WORK_DIR/package-build/$release_id/$arch"
 	local extract_dir="$staging_dir/extract"
 	local package_root="$staging_dir/root"
-	rm -rf "$staging_dir"
-	mkdir -p "$extract_dir" "$package_root/DEBIAN" "$package_root/usr/bin"
-	chmod 0755 "$package_root" "$package_root/DEBIAN" "$package_root/usr" "$package_root/usr/bin"
+	if ! rm --recursive --force "$staging_dir"; then
+		return 1
+	fi
+	if ! mkdir --parents "$extract_dir" "$package_root/DEBIAN" "$package_root/usr/bin"; then
+		return 1
+	fi
+	if ! chmod 0755 "$package_root" "$package_root/DEBIAN" "$package_root/usr" "$package_root/usr/bin"; then
+		return 1
+	fi
 
-	tar -xzf "$asset_path" -C "$extract_dir"
+	if ! tar --extract --gzip --file="$asset_path" --directory="$extract_dir"; then
+		return 1
+	fi
 	local pixi_binary
-	pixi_binary="$(locate_pixi_binary "$extract_dir")"
-	install -m 0755 "$pixi_binary" "$package_root/usr/bin/pixi"
-	write_control_file "$package_root/DEBIAN/control" "$version" "$arch"
+	if ! pixi_binary="$(locate_pixi_binary "$extract_dir")"; then
+		return 1
+	fi
+	if ! install --mode=0755 "$pixi_binary" "$package_root/usr/bin/pixi"; then
+		return 1
+	fi
+	if ! write_control_file "$package_root/DEBIAN/control" "$version" "$arch"; then
+		return 1
+	fi
+	if ! find "$package_root" -exec touch --no-dereference --date="@$source_date_epoch" {} +; then
+		return 1
+	fi
 
-	dpkg-deb --build --root-owner-group "$package_root" "$out_deb" >/dev/null
+	local out_dir
+	if ! out_dir="$(dirname -- "$out_deb")"; then
+		return 1
+	fi
+	if ! mkdir --parents "$out_dir"; then
+		return 1
+	fi
+	local temporary_output
+	if ! temporary_output="$(mktemp "$out_dir/.deb-build.XXXXXX")"; then
+		return 1
+	fi
+	if ! rm --force -- "$temporary_output"; then
+		return 1
+	fi
+	if ! SOURCE_DATE_EPOCH="$source_date_epoch" dpkg-deb \
+		--build \
+		--root-owner-group \
+		--deb-format=2.0 \
+		--uniform-compression \
+		-Zxz \
+		-z6 \
+		"$package_root" "$temporary_output" >/dev/null; then
+		rm --force -- "$temporary_output"
+		return 1
+	fi
+	if ! mv -- "$temporary_output" "$out_deb"; then
+		rm --force -- "$temporary_output"
+		return 1
+	fi
 }
