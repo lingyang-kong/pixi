@@ -230,12 +230,22 @@ run_poll() {
 	local poll_result=$3
 
 	: >"$TEST_DIRECTORY/workflow-output"
-	GITHUB_OUTPUT="$TEST_DIRECTORY/workflow-output" \
+	PUBLISHED_MANIFEST_URL="$MANIFEST_URL" \
+		FORCE_BUILD="$force_value" \
 		POLL_EXPECTED_URL="$MANIFEST_URL" \
 		POLL_MODE="$poll_mode" \
 		POLL_RESULT="$poll_result" \
-		"$poll_script" "$MANIFEST_URL" "$force_value"
+		"$poll_script" >"$TEST_DIRECTORY/workflow-output"
 }
+
+: >"$TEST_DIRECTORY/workflow-output"
+PUBLISHED_MANIFEST_URL='' \
+	FORCE_BUILD='' \
+	POLL_EXPECTED_URL='https://lingyang-kong.github.io/pixi/releases.json' \
+	POLL_MODE=success \
+	POLL_RESULT=false \
+	"$poll_script" >"$TEST_DIRECTORY/workflow-output"
+assert_equal 'false' "$(<"$TEST_DIRECTORY/workflow-output")" 'default URL and force value preserve an unchanged release'
 
 if run_poll true fail false; then
 	printf '%s\n' 'FAIL: forced workflow poll masked API failure' >&2
@@ -250,7 +260,7 @@ if ! run_poll true success false; then
 	printf '%s\n' 'FAIL: forced workflow poll failed' >&2
 	exit 1
 fi
-assert_equal 'changed=true' "$(<"$TEST_DIRECTORY/workflow-output")" 'manual force input enables workflow build'
+assert_equal 'true' "$(<"$TEST_DIRECTORY/workflow-output")" 'manual force input enables workflow build'
 
 if run_poll false success maybe; then
 	printf '%s\n' 'FAIL: invalid poll result unexpectedly succeeded' >&2

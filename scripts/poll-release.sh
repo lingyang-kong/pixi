@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
 set -o errexit -o nounset -o pipefail
 
-SCRIPT_DIR="$(
-	if ! cd -- "$(dirname -- "${BASH_SOURCE[0]}")"; then
-		exit 1
-	fi
-	pwd
-)"
-
-if [[ $# -ne 2 ]]; then
-	printf 'usage: %s MANIFEST_URL FORCE_BUILD\n' "$(basename -- "$0")" >&2
+if [[ $# -ne 0 ]]; then
+	printf 'usage: %s\n' "$(basename -- "$0")" >&2
 	exit 2
 fi
 
-manifest_url=$1
-force_build=$2
-case $force_build in
+readonly PUBLISHED_MANIFEST_URL="${PUBLISHED_MANIFEST_URL:-https://lingyang-kong.github.io/pixi/releases.json}"
+readonly FORCE_BUILD=${FORCE_BUILD:-false}
+case $FORCE_BUILD in
 true | false) ;;
 *)
-	printf '%s\n' 'FORCE_BUILD must be true or false' >&2
+	printf 'FORCE_BUILD must be true or false\n' >&2
 	exit 2
 	;;
 esac
 
-if ! changed="$("$SCRIPT_DIR/sync-apt-repo.sh" --check-newest-release "$manifest_url")"; then
-	printf '%s\n' 'newest release poll failed' >&2
+SCRIPT_DIR="$(dirname -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR
+
+if ! changed="$("$SCRIPT_DIR/sync-apt-repo.sh" --check-newest-release "$PUBLISHED_MANIFEST_URL")"; then
+	printf 'newest release poll failed\n' >&2
 	exit 1
 fi
 
@@ -36,9 +32,8 @@ true | false) ;;
 	;;
 esac
 
-if [[ $force_build == true ]]; then
+if [[ $FORCE_BUILD == true ]]; then
 	changed=true
 fi
 
-: "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
-printf 'changed=%s\n' "$changed" >>"$GITHUB_OUTPUT"
+printf '%s\n' "$changed"
