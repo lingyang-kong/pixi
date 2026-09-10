@@ -6,7 +6,7 @@ if [[ $# -ne 0 ]]; then
 	exit 2
 fi
 
-readonly PUBLISHED_MANIFEST_URL="${PUBLISHED_MANIFEST_URL:-https://lingyang-kong.github.io/pixi/releases.json}"
+readonly PUBLISHED_MANIFEST_URL="${PUBLISHED_MANIFEST_URL:-https://lingyang-kong.github.io/apt-pixi/releases.json}"
 readonly FORCE_BUILD=${FORCE_BUILD:-false}
 case $FORCE_BUILD in
 true | false) ;;

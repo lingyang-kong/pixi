@@ -35,10 +35,10 @@ The mirror signature attests to this repository's generated APT metadata. It doe
 Example for `amd64`:
 
 ```sh
-curl -fsSL 'https://lingyang-kong.github.io/pixi/pixi-archive-keyring.gpg' \
+curl -fsSL 'https://lingyang-kong.github.io/apt-pixi/pixi-archive-keyring.gpg' \
   | sudo tee /usr/share/keyrings/pixi-archive-keyring.gpg >/dev/null
 
-echo 'deb [signed-by=/usr/share/keyrings/pixi-archive-keyring.gpg] https://lingyang-kong.github.io/pixi stable main' \
+echo 'deb [signed-by=/usr/share/keyrings/pixi-archive-keyring.gpg] https://lingyang-kong.github.io/apt-pixi stable main' \
   | sudo tee /etc/apt/sources.list.d/pixi.list
 
 sudo apt update

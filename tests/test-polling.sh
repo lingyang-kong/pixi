@@ -241,7 +241,7 @@ run_poll() {
 : >"$TEST_DIRECTORY/workflow-output"
 PUBLISHED_MANIFEST_URL='' \
 	FORCE_BUILD='' \
-	POLL_EXPECTED_URL='https://lingyang-kong.github.io/pixi/releases.json' \
+	POLL_EXPECTED_URL='https://lingyang-kong.github.io/apt-pixi/releases.json' \
 	POLL_MODE=success \
 	POLL_RESULT=false \
 	"$poll_script" >"$TEST_DIRECTORY/workflow-output"
